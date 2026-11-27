@@ -34,8 +34,11 @@ jobs:
         include:
           - { nix_system: x86_64-linux,   runner: ubuntu-24.04 }
           - { nix_system: aarch64-linux,  runner: ubuntu-24.04-arm }
-          - { nix_system: aarch64-darwin, runner: macos-14 }
-          - { nix_system: x86_64-darwin,  runner: macos-13 }
+          # macos-14 and macos-13 are retired: a job targeting either is
+          # cancelled before its first step, with no error anywhere. The
+          # Intel lane is the last hosted x86_64 macOS image there is.
+          - { nix_system: aarch64-darwin, runner: macos-15 }
+          - { nix_system: x86_64-darwin,  runner: macos-15-intel }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,8 +135,9 @@ jobs:
 
   release:
     needs: build
-    # A lane that fails (macos-13 is on its way out) should still let the
-    # others publish; the flake pins per-system hashes anyway.
+    # A lane that fails or never gets a runner should still let the others
+    # publish; the flake pins per-system hashes anyway, and assets land on
+    # one tag per upstream ref, so a later re-dispatch fills in the gaps.
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     steps:
