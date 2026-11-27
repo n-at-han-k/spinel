@@ -1,0 +1,170 @@
+name: Binaries
+
+# Upstream's release.yml attaches a *source* archive (`make dist`: the tree
+# plus the parsers `make deps` would fetch), so a release carries nothing a
+# Nix flake can pin. This builds the installed prefix on each target we care
+# about and attaches it as a relocatable tarball.
+#
+# Relocatable because spinel finds its runtime through /proc/self/exe --
+# _NSGetExecutablePath on macOS -- and then looks for a sibling lib/ (see
+# exe_dir/resolve_lib_dir in src/main.c). No prefix is baked in at compile
+# time, so the tree works wherever it lands; the one fixup needed is turning
+# `make install`'s absolute bin/ symlinks into relative ones.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref (tag, branch or SHA) to build"
+        required: false
+        default: master
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.nix_system }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      # Named for Nix's system strings rather than the runners', so the
+      # consuming flake can select an asset by `system` directly.
+      matrix:
+        include:
+          - { nix_system: x86_64-linux,   runner: ubuntu-24.04 }
+          - { nix_system: aarch64-linux,  runner: ubuntu-24.04-arm }
+          - { nix_system: aarch64-darwin, runner: macos-14 }
+          - { nix_system: x86_64-darwin,  runner: macos-13 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: matz/spinel
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0 # git describe needs the tags
+
+      # CRuby bootstraps the self-hosted backend. The runner images ship one,
+      # but pinning it keeps a lane from breaking when an image bumps Ruby.
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: Record the version
+        id: version
+        run: echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+
+      # -static needs the static archives, which the images do not all carry.
+      - name: Static libc archives (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxcrypt-dev
+
+      # The consumer installs this binary into the Nix store raw, the way its
+      # flake already installs ast-grep -- and that one works only because it
+      # is static-pie. NixOS has no /lib64/ld-linux-*.so.2, so a dynamically
+      # linked spinel would not start at all.
+      #
+      # Only the executables go static. The installed libspinel_rt*.a stay
+      # ordinary glibc objects on purpose: they are linked by the *consumer's*
+      # cc into each generated program, against the consumer's glibc, so
+      # building them against anything else (musl) would break every compile.
+      #
+      # local.mk is common.mk's own machine-local hook, and it is included
+      # before the platform `LDFLAGS += -lcrypt`, so this appends to the
+      # platform flags instead of replacing them the way `make LDFLAGS=...`
+      # would. macOS has no static libSystem and needs none -- libSystem is
+      # stable, and nix-darwin provides it.
+      - name: Link the executables statically (Linux)
+        if: runner.os == 'Linux'
+        run: echo 'LDFLAGS += -static' > local.mk
+
+      - name: Fetch the vendored parsers
+        run: make deps
+
+      - name: Build
+        run: make
+
+      - name: Install into a staging prefix
+        run: make install PREFIX="$PWD/stage"
+
+      # `make install` writes $(PREFIX)-absolute symlinks, which would point
+      # into this runner's workspace. Relative ones survive unpacking anywhere.
+      - name: Make the tree relocatable
+        run: |
+          cd stage/bin
+          for link in *; do
+            if [ -L "$link" ]; then
+              ln -sfn "../lib/spinel/$(basename "$(readlink "$link")")" "$link"
+            fi
+          done
+          ls -l .
+
+      # Proves the staged tree compiles through its *relocated* entry point,
+      # not just that `make` produced a binary.
+      - name: Smoke test the staged toolchain
+        run: |
+          mkdir -p smoke && cd smoke
+          echo 'puts "hello from spinel"' > hello.rb
+          ../stage/bin/spinel hello.rb -o hello
+          out="$(./hello)"
+          echo "$out"
+          test "$out" = "hello from spinel"
+          echo "--- linkage ---"
+          file ../stage/lib/spinel/spinel
+
+      - name: Pack
+        id: pack
+        run: |
+          asset="spinel-${{ steps.version.outputs.version }}-${{ matrix.nix_system }}.tar.xz"
+          tar -C stage -cJf "$asset" .
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          # Nix wants the SRI form, so emit it here rather than making the
+          # consumer run nix-prefetch-url against a published asset.
+          sri="sha256-$(openssl dgst -sha256 -binary "$asset" | openssl base64 -A)"
+          printf '%s  %s\n' "$sri" "${{ matrix.nix_system }}" > "sri-${{ matrix.nix_system }}.txt"
+          cat "sri-${{ matrix.nix_system }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spinel-${{ matrix.nix_system }}
+          path: |
+            ${{ steps.pack.outputs.asset }}
+            sri-${{ matrix.nix_system }}.txt
+
+  release:
+    needs: build
+    # A lane that fails (macos-13 is on its way out) should still let the
+    # others publish; the flake pins per-system hashes anyway.
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          ls -l
+          version="$(ls spinel-*.tar.xz | head -1 | sed -E 's/^spinel-(.*)-[^-]+-[^-]+\.tar\.xz$/\1/')"
+          tag="binaries-$version"
+
+          # The SRI hashes go in the notes so the flake's `hash = ` lines can
+          # be copied straight out of the release.
+          {
+            echo "Relocatable \`make install\` prefixes built from upstream \`${{ inputs.ref }}\` (\`$version\`)."
+            echo
+            echo "Linux executables are statically linked; the bundled \`libspinel_rt*.a\` are glibc objects for the consumer's own cc to link."
+            echo
+            echo '```'
+            cat sri-*.txt
+            echo '```'
+          } > notes.md
+
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "$tag" --notes-file notes.md
+          gh release edit "$tag" --notes-file notes.md
+          gh release upload "$tag" spinel-*.tar.xz sri-*.txt --clobber
