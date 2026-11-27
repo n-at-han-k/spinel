@@ -56,10 +56,17 @@ jobs:
         id: version
         run: echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
 
-      # -static needs the static archives, which the images do not all carry.
+      # -static resolves -lcrypt against libcrypt.a. The binary package is
+      # libcrypt-dev -- libxcrypt is the *source* package name and apt does
+      # not know it. libc6-dev normally pulls it in already, so this is a
+      # guard against an image that stops doing so; tolerate it being absent
+      # and let the link be the thing that complains.
       - name: Static libc archives (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxcrypt-dev
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libcrypt-dev || true
+          ls -l /usr/lib/*/libcrypt.a /usr/lib/*/libm.a 2>/dev/null || true
 
       # The consumer installs this binary into the Nix store raw, the way its
       # flake already installs ast-grep -- and that one works only because it
